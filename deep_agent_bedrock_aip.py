@@ -22,6 +22,31 @@ IAM for the caller (scope to your ARNs):
   bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream  -> the AIP ARN,
       the source system profile, and the foundation-model ARNs it routes to
   bedrock:GetInferenceProfile  -> the AIP ARN (only if you omit base_model below)
+
+
+SSL Fix
+# Concatenate certifi's public roots with your corporate root.
+# AWS_CA_BUNDLE *replaces* the default bundle, so include both —
+# otherwise any host your proxy doesn't intercept will start failing.
+cat "$(python -c 'import certifi; print(certifi.where())')" corp-root.pem > corp-bundle.pem
+export AWS_CA_BUNDLE="C:/BMODev/certs/corp-bundle.pem"
+
+or 
+import boto3
+from langchain_aws import ChatBedrockConverse
+
+bedrock_runtime = boto3.client(
+    "bedrock-runtime",
+    region_name=REGION,
+    verify=os.environ.get("CORP_CA_BUNDLE", True),   # path, or True for default
+)
+
+llm = ChatBedrockConverse(
+    model=AIP_ARN,
+    provider="openai",
+    base_model="openai.gpt-5.6-sol",   # keep this — it's what killed the IAM error
+    client=bedrock_runtime,
+)
 """
 
 import os

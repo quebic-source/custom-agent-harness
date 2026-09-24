@@ -1,168 +1,247 @@
 """
-BudgetGuard for scan_harness — wired to YOUR calculate_cost_usd + pricing table.
+Turn and budget guards for scan_harness.
+Drop at: src/scan_harness/adapter/usage_guard.py
 
-Drop in at: src/scan_harness/adapter/budget_guard.py
+Two independent guards you attach to a Strands Agent as hooks:
 
-Design notes specific to this codebase:
-  * Reuses calculate_cost_usd() and self.pricing. No second rate table.
-  * Raises your existing MaxTunsExceededError so callers need no change.
-  * Enforced on BeforeModelCallEvent (the only hook that can stop a call:
-    AfterModelCallEvent fires before metrics update and reads zero).
-  * Settles on AfterInvocationEvent, because BeforeModelCall never observes
-    the FINAL model call of a run — without this, a single-turn run meters $0.
-  * Usage baseline is keyed per-Agent: _build_agent() makes a new Agent each
-    call and Strands' accumulated_usage restarts at zero on each one.
+    TurnGuard    caps the number of model calls
+    BudgetGuard  caps USD spend, using your calculate_cost_usd()
+
+Both are armed by calling reset() at the start of each adapter invocation.
+
+
+WHY THESE HOOKS AND NOT OTHERS
+------------------------------
+BeforeModelCallEvent is the only place a call can be stopped before you pay
+for it. AfterModelCallEvent looks like the obvious choice but fires BEFORE
+Strands updates its metrics, so it reads zero on the first call and lags by
+one call forever.
+
+BudgetGuard also listens to AfterInvocationEvent. BeforeModelCall never sees
+the LAST model call of a run (nothing fires after it), so without a final
+settlement a single-turn run would report $0.00.
 """
 
-from __future__ import annotations
-
 import logging
-import threading
-import weakref
-from typing import Any
 
 from strands.hooks import (AfterInvocationEvent, BeforeModelCallEvent,
                            HookProvider, HookRegistry)
 
 LOGGER = logging.getLogger(__name__)
 
-_USAGE_KEYS = ("inputTokens", "outputTokens", "totalTokens",
-               "cacheReadInputTokens", "cacheWriteInputTokens")
+# The five token counters Bedrock reports.
+USAGE_KEYS = (
+    "inputTokens",
+    "outputTokens",
+    "totalTokens",
+    "cacheReadInputTokens",
+    "cacheWriteInputTokens",
+)
+
+
+class TurnLimitExceeded(RuntimeError):
+    """Used only if you don't pass your own error class to TurnGuard."""
 
 
 class BudgetExceededError(RuntimeError):
-    """Cumulative USD cap would be breached by the next model call."""
+    """The USD cap would be broken by the next model call."""
 
 
-def as_guard_error(exc: BaseException, *types: type) -> BaseException | None:
-    """Unwrap a guard error from Strands' EventLoopException.
+def as_guard_error(exc, *types):
+    """Find a guard error inside exc, or return None.
 
-    Strands wraps exceptions raised from a hook during tool-execution
-    recursion. Raised on the first model call it propagates bare; raised
-    after a tool has run it arrives wrapped. Always unwrap.
+    Strands wraps exceptions raised from a hook in EventLoopException once a
+    tool has run, so `except MaxTunsExceededError` misses most real trips.
+    Always unwrap:
+
+        except Exception as e:
+            hit = as_guard_error(e, MaxTunsExceededError, BudgetExceededError)
+            if hit is not None:
+                raise hit from e
+            raise
     """
-    seen: set[int] = set()
-    cur: BaseException | None = exc
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
-        if isinstance(cur, types):
-            return cur
-        cur = cur.__cause__ or cur.__context__
+    seen = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, types):
+            return current
+        current = current.__cause__ or current.__context__
     return None
 
 
-class BudgetGuard(HookProvider):
-    def __init__(self, model: str, cost_fn, pricing=None, turn_error_cls=RuntimeError):
-        """
-        model        — AIP ARN / model id, passed straight to cost_fn
-        cost_fn      — your calculate_cost_usd
-        pricing      — your self.pricing rate-table override
-        turn_error_cls — your MaxTunsExceededError
-        """
-        self.model = model
-        self._cost_fn = cost_fn
-        self.pricing = pricing
-        self._turn_error_cls = turn_error_cls
+class TurnGuard(HookProvider):
+    """Stops the agent after max_turns model calls.
 
-        self.max_usd: float | None = None
-        self.max_turns: int | None = None
-        self.reserve = True          # stop before the call that would breach
+    A turn is one model call plus any tool execution that follows it.
 
-        self._lock = threading.Lock()
-        self._seen: "weakref.WeakKeyDictionary[Any, dict]" = weakref.WeakKeyDictionary()
-        self._reset_counters()
+        guard = TurnGuard(error_cls=MaxTunsExceededError)
+        guard.reset(max_turns=40)
+        agent = Agent(..., hooks=[guard])
+    """
 
-    # -- lifecycle ----------------------------------------------------------
-    def _reset_counters(self) -> None:
-        self._spent_usd = 0.0
-        self._peak_call_usd = 0.0
-        self._turns = 0
-        self._totals = {k: 0 for k in _USAGE_KEYS}
+    def __init__(self, error_cls=TurnLimitExceeded):
+        self.error_cls = error_cls
+        self.max_turns = None
+        self.turns = 0
 
-    def reset(self, max_usd: float | None = None, max_turns: int | None = None) -> None:
-        """Start a fresh accounting window (call once per adapter invocation)."""
-        with self._lock:
-            self._reset_counters()
-            self._seen = weakref.WeakKeyDictionary()
-            self.max_usd = max_usd
-            self.max_turns = max_turns
-
-    # -- readouts -----------------------------------------------------------
-    @property
-    def turns(self) -> int:
-        return self._turns
+    def reset(self, max_turns=None):
+        """Arm the guard for a new invocation."""
+        self.max_turns = max_turns
+        self.turns = 0
 
     @property
-    def spent_usd(self) -> float:
-        return self._spent_usd
+    def remaining(self):
+        if self.max_turns is None:
+            return None
+        return max(0, self.max_turns - self.turns)
 
     @property
-    def totals(self) -> dict:
-        """Token totals in Bedrock's key names, ready for your Usage()."""
-        return dict(self._totals)
-
-    def usage_kwargs(self) -> dict:
-        """Maps straight onto your Usage dataclass fields."""
-        t = self._totals
+    def breakdown(self):
         return {
-            "input_tokens": t["inputTokens"],
-            "output_tokens": t["outputTokens"],
-            "cache_read_tokens": t["cacheReadInputTokens"],
-            "cache_write_tokens": t["cacheWriteInputTokens"],
-            "total_cost_usd": round(self._spent_usd, 6),
+            "turns": self.turns,
+            "max_turns": self.max_turns,
+            "remaining": self.remaining,
         }
 
-    # -- hooks --------------------------------------------------------------
-    def register_hooks(self, registry: HookRegistry, **_: object) -> None:
+    def register_hooks(self, registry: HookRegistry, **kwargs):
+        registry.add_callback(BeforeModelCallEvent, self._check)
+
+    def _check(self, event):
+        # Checked before the increment, so exactly max_turns calls run.
+        if self.max_turns is not None and self.turns >= self.max_turns:
+            LOGGER.warning("[TurnGuard] max_turns %s reached", self.max_turns)
+            raise self.error_cls(f"Max turns limit ({self.max_turns}) exceeded")
+        self.turns += 1
+
+
+class BudgetGuard(HookProvider):
+    """Stops the agent before USD spend passes max_usd.
+
+        guard = BudgetGuard(model=self.model,
+                            cost_fn=calculate_cost_usd,
+                            pricing=self.pricing)
+        guard.reset(max_usd=5.00)
+        agent = Agent(..., hooks=[guard])
+        ...
+        usage = Usage(**guard.usage_kwargs())
+
+    Note on Bedrock billing: inputTokens EXCLUDES the cache tokens, which are
+    reported and priced separately. All four counts are passed to cost_fn, so
+    keep them separate rather than adding cache tokens into inputTokens.
+    """
+
+    def __init__(self, model, cost_fn, pricing=None, reserve=True):
+        self.model = model
+        self.cost_fn = cost_fn
+        self.pricing = pricing
+        # reserve=True stops when the NEXT call is projected to break the cap,
+        # so spend never goes over. reserve=False lets the run cross the line
+        # first and stops after.
+        self.reserve = reserve
+
+        self.max_usd = None
+        self.spent_usd = 0.0
+        self.model_calls = 0
+        self.totals = {key: 0 for key in USAGE_KEYS}
+        self._last_call_usd = 0.0
+        # Token counts already accounted for. Strands reports usage as a
+        # running total per Agent, so we subtract this to get each new call.
+        self._counted = {key: 0 for key in USAGE_KEYS}
+
+    def reset(self, max_usd=None):
+        """Arm the guard for a new invocation."""
+        self.max_usd = max_usd
+        self.spent_usd = 0.0
+        self.model_calls = 0
+        self.totals = {key: 0 for key in USAGE_KEYS}
+        self._last_call_usd = 0.0
+        self._counted = {key: 0 for key in USAGE_KEYS}
+
+    @property
+    def remaining_usd(self):
+        if self.max_usd is None:
+            return None
+        return max(0.0, self.max_usd - self.spent_usd)
+
+    def usage_kwargs(self):
+        """Maps onto the fields of your Usage dataclass."""
+        return {
+            "input_tokens": self.totals["inputTokens"],
+            "output_tokens": self.totals["outputTokens"],
+            "cache_read_tokens": self.totals["cacheReadInputTokens"],
+            "cache_write_tokens": self.totals["cacheWriteInputTokens"],
+            "total_cost_usd": round(self.spent_usd, 6),
+        }
+
+    @property
+    def breakdown(self):
+        result = {
+            "model": self.model,
+            "model_calls": self.model_calls,
+            "spent_usd": round(self.spent_usd, 6),
+            "max_usd": self.max_usd,
+            "remaining_usd": self.remaining_usd,
+        }
+        result.update(self.totals)
+        return result
+
+    def register_hooks(self, registry: HookRegistry, **kwargs):
         registry.add_callback(BeforeModelCallEvent, self._check)
         registry.add_callback(AfterInvocationEvent, self._settle)
 
-    def _cost_of(self, delta: dict) -> float:
-        return self._cost_fn(
-            model=self.model,
-            input_tokens=delta["inputTokens"],
-            output_tokens=delta["outputTokens"],
-            cache_read_tokens=delta["cacheReadInputTokens"],
-            cache_write_tokens=delta["cacheWriteInputTokens"],
-            pricing=self.pricing,
-        )
-
-    def _accrue(self, agent: Any) -> None:
-        """Fold un-metered usage into the totals. Caller holds the lock."""
+    def _accrue(self, agent):
+        """Add whatever usage we have not counted yet."""
         current = agent.event_loop_metrics.accumulated_usage
-        baseline = self._seen.get(agent) or {}
-        delta = {k: max(0, int(current.get(k, 0)) - int(baseline.get(k, 0)))
-                 for k in _USAGE_KEYS}
-        if any(delta.values()):
-            call_usd = self._cost_of(delta)
-            self._spent_usd += call_usd
-            self._peak_call_usd = max(self._peak_call_usd, call_usd)
-            for k, v in delta.items():
-                self._totals[k] += v
-        self._seen[agent] = {k: int(current.get(k, 0)) for k in _USAGE_KEYS}
 
-    def _settle(self, event: AfterInvocationEvent) -> None:
-        with self._lock:
-            self._accrue(event.agent)
+        # A brand new Agent starts its counters at zero. If the numbers went
+        # backwards, _build_agent() made a fresh one, so count from zero.
+        if current.get("totalTokens", 0) < self._counted["totalTokens"]:
+            self._counted = {key: 0 for key in USAGE_KEYS}
 
-    def _check(self, event: BeforeModelCallEvent) -> None:
-        with self._lock:
-            self._accrue(event.agent)
+        new = {}
+        for key in USAGE_KEYS:
+            new[key] = max(0, int(current.get(key, 0)) - self._counted[key])
 
-            if self.max_turns is not None and self._turns >= self.max_turns:
-                LOGGER.warning("[BudgetGuard] max_turns %d reached (spent $%.4f)",
-                               self.max_turns, self._spent_usd)
-                raise self._turn_error_cls(
-                    f"Max turns limit ({self.max_turns}) exceeded")
+        if any(new.values()):
+            self._last_call_usd = self.cost_fn(
+                model=self.model,
+                input_tokens=new["inputTokens"],
+                output_tokens=new["outputTokens"],
+                cache_read_tokens=new["cacheReadInputTokens"],
+                cache_write_tokens=new["cacheWriteInputTokens"],
+                pricing=self.pricing,
+            )
+            self.spent_usd += self._last_call_usd
+            for key in USAGE_KEYS:
+                self.totals[key] += new[key]
 
-            self._turns += 1
+        for key in USAGE_KEYS:
+            self._counted[key] = int(current.get(key, 0))
 
-            if self.max_usd is None:
-                return
-            projected = self._spent_usd + (self._peak_call_usd if self.reserve else 0.0)
-            if projected > self.max_usd:
-                LOGGER.warning("[BudgetGuard] budget stop: spent $%.4f projected $%.4f cap $%.2f",
-                               self._spent_usd, projected, self.max_usd)
-                raise BudgetExceededError(
-                    f"Budget exceeded: spent ${self._spent_usd:.4f}, "
-                    f"next call projected ${projected:.4f}, cap ${self.max_usd:.2f}")
+    def _settle(self, event):
+        """Final accounting once the run is over. Never raises."""
+        self._accrue(event.agent)
+
+    def _check(self, event):
+        self._accrue(event.agent)
+        self.model_calls += 1
+
+        if self.max_usd is None:
+            return
+
+        projected = self.spent_usd
+        if self.reserve:
+            # The next call costs about what the last one did, and usually a
+            # little more, since each call resends the whole history.
+            projected += self._last_call_usd
+
+        if projected > self.max_usd:
+            LOGGER.warning(
+                "[BudgetGuard] stopping: spent $%.4f, next call about $%.4f, cap $%.2f",
+                self.spent_usd, projected, self.max_usd,
+            )
+            raise BudgetExceededError(
+                f"Budget exceeded: spent ${self.spent_usd:.4f}, "
+                f"next call projected ${projected:.4f}, cap ${self.max_usd:.2f}"
+            )
